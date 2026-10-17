@@ -33,6 +33,18 @@ rem  Everything the installer prints goes to C:\MinePRL\logs\install.log instead
 rem  the screen. Read it if something looks wrong, or just run STATUS.bat.
 if "%~1"=="--hidden" goto :hidden
 
+rem  If this window is ALREADY administrator - you right-clicked "Run as
+rem  administrator", or started it from an admin console - then there is nothing
+rem  left to elevate. Relaunch hidden with the SAME token, which cannot raise a
+rem  UAC prompt. Start-Process only shows UAC when -Verb RunAs is used.
+whoami /groups | findstr /c:"S-1-16-12288" >nul 2>&1
+if not errorlevel 1 (
+    powershell -NoProfile -WindowStyle Hidden -Command "Start-Process -FilePath '%~f0' -ArgumentList '--hidden' -WindowStyle Hidden"
+    exit /b 0
+)
+
+rem  Not administrator. A plain double-click still has to elevate to set the power
+rem  limit and register the startup task, so ask once rather than failing silently.
 powershell -NoProfile -WindowStyle Hidden -Command "Start-Process -FilePath '%~f0' -ArgumentList '--hidden' -Verb RunAs -WindowStyle Hidden"
 exit /b 0
 
