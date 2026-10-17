@@ -274,18 +274,120 @@ Set-Content -LiteralPath $runnerPath -Value $runner -Encoding UTF8
 Ok "runner written to $runnerPath"
 
 # ---------------------------------------------------------------------------
-#  5. persistence  -  runs at every logon, elevated
+#  4b. the status command  -  run this instead of staring at a console
+# ---------------------------------------------------------------------------
+Head 'CREATING THE STATUS COMMAND'
+$statusPath = Join-Path $Install 'Status.ps1'
+
+$status = @'
+# Auto-generated. Read-only: shows what the miner is doing, changes nothing.
+$ErrorActionPreference = 'SilentlyContinue'
+$Install = 'C:\MinePRL'
+$LogDir  = Join-Path $Install 'logs'
+
+Write-Host ''
+Write-Host ('=' * 72) -ForegroundColor Cyan
+Write-Host '  PEARL MINER - STATUS' -ForegroundColor Cyan
+Write-Host ('=' * 72) -ForegroundColor Cyan
+Write-Host ''
+
+$t = Get-ScheduledTask -TaskName 'PearlMiner'
+if ($t) {
+    Write-Host ('  autostart     : {0}   run level {1}' -f $t.State, $t.Principal.RunLevel)
+} else {
+    Write-Host '  autostart     : NOT INSTALLED' -ForegroundColor Red
+}
+
+$p = @(Get-Process SRBMiner-MULTI -ErrorAction SilentlyContinue)
+if ($p.Count -gt 0) {
+    $age = (Get-Date) - $p[0].StartTime
+    $win = if ($p[0].MainWindowHandle -eq 0) { 'no window (hidden, as intended)' } else { 'HAS A VISIBLE WINDOW' }
+    Write-Host ('  miner         : running, pid {0}, up {1:N0}h {2:N0}m - {3}' -f $p[0].Id, [math]::Floor($age.TotalHours), $age.Minutes, $win) -ForegroundColor Green
+} else {
+    Write-Host '  miner         : NOT RUNNING' -ForegroundColor Red
+}
+
+$nv = Get-Command nvidia-smi -ErrorAction SilentlyContinue
+if ($nv) {
+    $g = & nvidia-smi --query-gpu=name,power.limit,power.draw,temperature.gpu,utilization.gpu,fan.speed --format=csv,noheader
+    if ($g) { Write-Host ('  gpu           : {0}' -f $g) }
+}
+
+$latest = Get-ChildItem $LogDir -Filter 'miner-*.log' -ErrorAction SilentlyContinue |
+          Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if ($latest) {
+    Write-Host ('  log           : {0}   {1:N0} KB   updated {2:HH:mm:ss}' -f $latest.Name, ($latest.Length / 1KB), $latest.LastWriteTime)
+    $lines = @(Get-Content $latest.FullName -Tail 500 -ErrorAction SilentlyContinue)
+
+    $hr = $lines | Select-String 'Total:' | Select-Object -Last 1
+    if ($hr) { Write-Host ('  hashrate      : {0}' -f ($hr.Line -replace '^\[[^\]]+\]\s*', '')) }
+
+    $acc = @($lines | Select-String 'share accepted').Count
+    $rej = @($lines | Select-String 'share rejected').Count
+    Write-Host ('  shares (tail) : {0} accepted, {1} rejected' -f $acc, $rej)
+
+    Write-Host ''
+    Write-Host '  --- last 10 log lines ---' -ForegroundColor DarkGray
+    $lines | Select-Object -Last 10 | ForEach-Object { Write-Host ('  ' + $_) }
+} else {
+    Write-Host '  log           : none yet' -ForegroundColor Yellow
+}
+
+Write-Host ''
+'@
+
+Set-Content -LiteralPath $statusPath -Value $status -Encoding UTF8
+
+$statusBat = @'
+@echo off
+title Pearl miner - status
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0Status.ps1"
+echo.
+echo   Storage   : C:\MinePRL
+echo   Stop      : STOP.bat
+echo   Start     : START.bat
+echo.
+pause
+'@
+Set-Content -LiteralPath (Join-Path $Install 'STATUS.bat') -Value $statusBat -Encoding ASCII
+
+$stopBat = @'
+@echo off
+schtasks /end /tn PearlMiner >nul 2>&1
+for /f "tokens=2 delims=," %%P in ('tasklist /fi "imagename eq SRBMiner-MULTI.exe" /fo csv /nh 2^>nul') do taskkill /pid %%~P /f >nul 2>&1
+echo   Miner stopped. Autostart stays armed, so it returns at next logon.
+echo   Run STOP-PERMANENT.bat to remove autostart as well.
+pause
+'@
+Set-Content -LiteralPath (Join-Path $Install 'STOP.bat') -Value $stopBat -Encoding ASCII
+
+$startBat = @'
+@echo off
+schtasks /run /tn PearlMiner >nul 2>&1
+start "" "%~dp0STATUS.bat"
+'@
+Set-Content -LiteralPath (Join-Path $Install 'START.bat') -Value $startBat -Encoding ASCII
+
+Ok "STATUS.bat, START.bat and STOP.bat written to $Install"
+
+# ---------------------------------------------------------------------------
+#  5. persistence  -  runs at every logon, elevated, WITH NO WINDOW
 # ---------------------------------------------------------------------------
 Head 'SETTING UP AUTOSTART'
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
     -Argument ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $runnerPath)
 $trigger = New-ScheduledTaskTrigger -AtLogOn
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -RunLevel Highest -LogonType Interactive
+# -Hidden keeps the task itself out of sight; -WindowStyle Hidden in the action
+# keeps the console away. Together there is no terminal on screen at all.
+$settings = New-ScheduledTaskSettingsSet -Hidden -StartWhenAvailable `
+    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
 
 try {
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
-        -Principal $principal -Force -Description 'Pearl (PRL) mining to Kryptex' | Out-Null
-    Ok "scheduled task '$TaskName' created - mining resumes at every logon"
+        -Principal $principal -Settings $settings -Force `
+        -Description 'Pearl (PRL) mining to Kryptex - hidden' | Out-Null
+    Ok "scheduled task '$TaskName' created - hidden, resumes at every logon"
     Line '         NOTE: this starts when the user logs in. If a power cut leaves the'
     Line '         PC at the lock screen, mining waits until someone logs in. Enable'
     Line '         automatic logon if you want it to resume with nobody there.'
@@ -324,9 +426,13 @@ if (Test-Path $today) {
 Head 'SUMMARY'
 Line "  installed to : $Install"
 Line "  log file     : $today"
-Line "  autostart    : $TaskName  (at logon, elevated)"
+Line "  autostart    : $TaskName  (hidden, at logon, elevated)"
 Line ''
-Line '  To stop:        schtasks /end /tn PearlMiner'
+Line '  NO WINDOW runs in the background. To see what it is doing, run:'
+Line "      $Install\STATUS.bat"
+Line ''
+Line '  To stop:        STOP.bat'
+Line '  To start:       START.bat'
 Line '  To uninstall:   schtasks /delete /tn PearlMiner /f   then delete C:\MinePRL'
 Line ''
 

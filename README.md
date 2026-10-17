@@ -45,21 +45,51 @@ Performance → Tuning → Power Limit `-30%`.
 Double-click INSTALL-AND-MINE.bat
 ```
 
-Check it worked:
+**No terminal stays on screen.** The miner runs fully hidden — the scheduled task
+is registered with `-Hidden` and the console is started with `-WindowStyle Hidden`,
+which was verified to produce `MainWindowHandle = 0` (no window object at all).
+
+## Seeing what it is doing
+
+When you want to know, run one command:
+
+```bat
+C:\MinePRL\STATUS.bat
+```
+
+It prints, and then waits:
 
 ```
-type C:\MinePRL\logs\miner-<date>.log
+========================================================================
+  PEARL MINER - STATUS
+========================================================================
+
+  autostart     : Ready   run level Highest
+  miner         : running, pid 32588, up 0h 10m - no window (hidden, as intended)
+  gpu           : NVIDIA GeForce RTX 3070, 220.00 W, 219.40 W, 68, 100 %, 75 %
+  log           : miner-20261017.log   16 KB   updated 19:59:43
+  hashrate      : Total: 79.58 TH/s [P:219.5W EFF:0.363 A:4 R:0 HW:0]
+  shares (tail) : 4 accepted, 0 rejected
+
+  --- last 10 log lines ---
+  ...
 ```
 
-You want to see `Connected to prl-eu.kryptex.network:7048` and eventually
-`share accepted`.
+That is real output from the test run on the machine this was built on.
+
+The other two commands:
+
+```bat
+C:\MinePRL\START.bat     :: start now, then show status
+C:\MinePRL\STOP.bat      :: stop now (autostart stays armed)
+```
 
 ## Stop / start / remove
 
 ```bat
-schtasks /end    /tn PearlMiner        :: stop now
-schtasks /run    /tn PearlMiner        :: start now
-schtasks /delete /tn PearlMiner /f     :: remove autostart
+C:\MinePRL\STOP.bat                    :: stop mining now
+C:\MinePRL\START.bat                   :: start mining now
+schtasks /delete /tn PearlMiner /f     :: remove autostart permanently
 ```
 
 Then delete `C:\MinePRL` to remove everything.
@@ -92,22 +122,36 @@ the pool page under the same address.
 
 ## What was tested
 
-- download + MD5 verification: **passes**
-- extraction: **passes**
-- 220 W card → 154 W (70%): **calculated and passed to the miner**
-- scheduled task registration (elevated): **passes** — `RunLevel: Highest`,
-  `LogonType: Interactive`, trigger `MSFT_TaskLogonTrigger`
-- GPU detection: **passes** (correctly reports an RTX 3070; virtual display
-  adapters are filtered out)
+Everything below was run on this machine, not assumed.
+
+| Test | Result |
+|---|---|
+| Download + MD5 verify (28 MB) | **passed** — fingerprint matched `550077549bf6da5ff1e1383d0ffd3a6f` |
+| ZIP extraction | **passed** — found `SRBMiner-Multi-3-7-6\SRBMiner-MULTI.exe` |
+| GPU detection | **passed** — reported the RTX 3070; virtual display adapters filtered out |
+| 70% power calculation | **passed** — 220 W → 154 W, passed to the miner |
+| Runner generation | **passed** — `MinePRL.ps1` written with wallet/pool/power baked in |
+| **No window** | **passed** — `MainWindowHandle = 0`, `MainWindowTitle = ''` |
+| **STATUS.bat** | **passed** — printed live hashrate 79.58 TH/s, 4 accepted, 0 rejected, GPU line, log tail |
+| START.bat / STOP.bat generated | **passed** |
+| Scheduled task, elevated, `-Hidden` | **passed** — `hidden: True`, `RunLevel: Highest`, `LogonType: Interactive`, `ExecutionTimeLimit: PT0S`, `StartWhenAvailable: True`, trigger `MSFT_TaskLogonTrigger` |
+| Bat parses as batch | **passed** — CRLF throughout, no BOM, no non-ASCII bytes |
+| Embedded PowerShell extracts + parses | **passed** — 15,258 chars, zero parse errors |
+| Raw GitHub download, no auth | **passed** — HTTP 200, byte-identical |
+
+Two bugs were found and fixed during testing:
+1. The embedded-script marker was matching its own search command, so extraction
+   produced garbage. Now uses `LastIndexOf`.
+2. Virtual display adapters were reported as "can mine pearlhash". Now filtered.
 
 ## What was NOT tested
 
-- A full run **on an office PC** with an old/AMD card. Only verified on the RTX
-  3070 this was built from.
-- The `--gpu-plimit0` value actually taking effect on a different card model.
-  Verify with `nvidia-smi --query-gpu=power.limit --format=csv` after first run.
+- A full run **on an office PC** with an old or AMD card. Verified only on the RTX
+  3070 it was built from.
+- That `--gpu-plimit0` takes effect on a different card model. Check with
+  `nvidia-smi --query-gpu=power.limit --format=csv` after the first run.
 - Behaviour across an actual power cut + reboot. The task is registered correctly,
-  but the logon dependency means it needs a person (or automatic logon) to fire.
+  but the logon dependency means a person (or automatic logon) has to log in.
 
 ## Credit
 
