@@ -332,6 +332,14 @@ $args = @(
 
 while ($true) {
     "=== starting $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ===" | Out-File -FilePath $log -Append -Encoding UTF8
+    # SRBMiner's own watchdog can re-exec itself as a child process and exit 0.
+    # This loop would then start a second miner on the same GPU. Two miners do not
+    # share evenly, they thrash: measured 79 TH/s -> 25 TH/s with the clock RISING.
+    # Anything already running here is an orphan, so clear it first.
+    foreach ($o in @(Get-Process SRBMiner-MULTI -ErrorAction SilentlyContinue)) {
+        try { Stop-Process -Id $o.Id -Force -ErrorAction Stop } catch { }
+    }
+    Start-Sleep -Seconds 2
     try {
         & $Exe @args *>> $log
     } catch {
