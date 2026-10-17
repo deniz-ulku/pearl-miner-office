@@ -176,6 +176,43 @@ $script:LogFile = Join-Path $LogDir 'install.log'
 "=== install started $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ===" | Set-Content -LiteralPath $script:LogFile -Encoding UTF8
 
 # ---------------------------------------------------------------------------
+#  0b. Visual C++ runtime  -  SRBMiner is a native binary and needs it
+# ---------------------------------------------------------------------------
+# A bare Windows image can lack the VC++ 2015-2022 x64 runtime. SRBMiner then
+# exits immediately with a loader error, which surfaces as "the miner did not
+# start" with nothing in its log - impossible to diagnose from the outside.
+#
+# Two independent sources, because a false negative here would block a machine
+# that actually works:
+#   * the DLLs in System32
+#   * the redistributable's own registry entry
+# Only refuse when BOTH say missing.
+$dlls = @('vcruntime140.dll','vcruntime140_1.dll','msvcp140.dll')
+$missing = @()
+foreach ($d in $dlls) {
+    if (-not (Test-Path (Join-Path $env:SystemRoot ('System32\' + $d)))) { $missing += $d }
+}
+$regOk = $false
+foreach ($hive in 'HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64',
+                  'HKLM:\SOFTWARE\WOW6432Node\Microsoft\VisualStudio\14.0\VC\Runtimes\x64') {
+    try {
+        $v = Get-ItemProperty -LiteralPath $hive -ErrorAction Stop
+        if ($v.Installed -eq 1) { $regOk = $true }
+    } catch { }
+}
+if ($missing.Count -eq 0 -or $regOk) {
+    Ok 'Visual C++ runtime present'
+} else {
+    Warn ('Visual C++ runtime looks MISSING (no ' + ($missing -join ', ') + ', and no registry entry)')
+    Line '         SRBMiner is a native binary and will not start without it.'
+    Line '         Install the free Microsoft Visual C++ 2015-2022 Redistributable (x64):'
+    Line '            https://aka.ms/vs/17/release/vc_redist.x64.exe'
+    Line '         Then run this installer again. Nothing was installed.'
+    Start-Sleep -Seconds 8
+    exit 12
+}
+
+# ---------------------------------------------------------------------------
 #  1. GPU detection  -  Pearl needs AMD or NVIDIA. Intel cannot mine it.
 # ---------------------------------------------------------------------------
 Head 'GPU DETECTION'
