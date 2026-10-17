@@ -100,6 +100,43 @@ $ZipUrl   = 'https://github.com/doktor83/SRBMiner-Multi/releases/download/3.7.6/
 $ZipMd5   = '550077549bf6da5ff1e1383d0ffd3a6f'
 $PowerPct = 0.70
 
+# ---------------------------------------------------------------------------
+#  0. UNIVERSALITY GATE  -  Windows 10/11, 64-bit only
+# ---------------------------------------------------------------------------
+# SRBMiner-MULTI ships a 64-bit binary only. On 32-bit Windows it starts and
+# immediately dies, which looks like "the miner crashed" and is impossible to
+# diagnose from the log. Say it plainly instead.
+$is64 = $false
+try {
+    if ([Environment]::Is64BitOperatingSystem) { $is64 = $true }
+} catch { }
+if (-not $is64) {
+    Write-Host ''
+    Write-Host '  [XX]   This is a 32-bit Windows installation.' -ForegroundColor Red
+    Write-Host '         SRBMiner-MULTI is 64-bit only and cannot run here.' -ForegroundColor Red
+    Write-Host '         Nothing was installed.' -ForegroundColor Red
+    Write-Host ''
+    Start-Sleep -Seconds 6
+    exit 10
+}
+
+$os = $null
+try { $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop } catch { }
+$osBuild = 0; $osName = 'Windows'
+if ($os) {
+    $osName  = $os.Caption
+    $osBuild = [int]$os.BuildNumber
+}
+# Windows 10 is build 10240+, Windows 11 is 22000+. SRBMiner needs Win10-era APIs.
+if ($osBuild -gt 0 -and $osBuild -lt 10240) {
+    Write-Host ''
+    Write-Host ("  [XX]   {0} (build {1}) is too old." -f $osName, $osBuild) -ForegroundColor Red
+    Write-Host '         Windows 10 or 11 is required. Nothing was installed.' -ForegroundColor Red
+    Write-Host ''
+    Start-Sleep -Seconds 6
+    exit 11
+}
+
 $script:LogFile = $null
 function Line {
     param($t = '')
@@ -147,18 +184,43 @@ Line ''
 
 $gpus = @()
 
+# nvidia-smi is NOT always on PATH. Older drivers install it under Program Files,
+# and some locked-down images strip PATH entirely. Ask every known location.
 $nvsmi = $null
-try { $nvsmi = (Get-Command nvidia-smi -ErrorAction Stop).Source } catch { }
+foreach ($cand in @(
+    'nvidia-smi.exe',
+    (Join-Path $env:SystemRoot 'System32\nvidia-smi.exe'),
+    'C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe',
+    'C:\Windows\System32\nvidia-smi.exe'
+)) {
+    try {
+        $p = (Get-Command $cand -ErrorAction Stop).Source
+        if ($p) { $nvsmi = $p; break }
+    } catch { }
+}
 
 if ($nvsmi) {
     try {
-        $rows = & $nvsmi --query-gpu=name,power.default_limit --format=csv,noheader,nounits 2>$null
+        # min_limit and max_limit matter: 70% of the DEFAULT can fall below what
+        # the card will accept. Seen on an RTX 4060 Laptop: 80 W default -> 56 W,
+        # which SRBMiner may reject outright, leaving a miner that never appears.
+        $rows = & $nvsmi --query-gpu=name,power.default_limit,power.min_limit,power.max_limit --format=csv,noheader,nounits 2>$null
         foreach ($r in $rows) {
             if (-not $r) { continue }
             $p = $r -split ','
-            if ($p.Count -ge 2) {
+            if ($p.Count -ge 4) {
                 $gpus += [pscustomobject]@{
-                    Vendor = 'NVIDIA'; Name = $p[0].Trim(); DefaultW = [double](($p[1] -replace '[^0-9.]',''))
+                    Vendor   = 'NVIDIA'
+                    Name     = $p[0].Trim()
+                    DefaultW = [double](($p[1] -replace '[^0-9.]',''))
+                    MinW     = [double](($p[2] -replace '[^0-9.]',''))
+                    MaxW     = [double](($p[3] -replace '[^0-9.]',''))
+                }
+            } elseif ($p.Count -ge 2) {
+                $gpus += [pscustomobject]@{
+                    Vendor = 'NVIDIA'; Name = $p[0].Trim()
+                    DefaultW = [double](($p[1] -replace '[^0-9.]',''))
+                    MinW = 0; MaxW = 0
                 }
             }
         }
@@ -175,7 +237,7 @@ try {
         $vendor = if ($v.Name -match 'AMD|Radeon') { 'AMD' }
                   elseif ($v.Name -match 'Intel')  { 'Intel' }
                   else { 'Other' }
-        $gpus += [pscustomobject]@{ Vendor = $vendor; Name = $v.Name; DefaultW = 0 }
+        $gpus += [pscustomobject]@{ Vendor = $vendor; Name = $v.Name; DefaultW = 0; MinW = 0; MaxW = 0 }
     }
 } catch { }
 
@@ -283,8 +345,17 @@ if ($nvidia.Count -gt 0) {
     foreach ($g in $nvidia) {
         if ($g.DefaultW -gt 0) {
             $w = [int][math]::Round($g.DefaultW * $PowerPct)
+            $clamped = $false
+            # Never hand SRBMiner a wattage the card refuses. A rejected
+            # --gpu-plimit0 can stop the miner from ever appearing.
+            if ($g.MinW -gt 0 -and $w -lt $g.MinW) { $w = [int][math]::Round($g.MinW); $clamped = $true }
+            if ($g.MaxW -gt 0 -and $w -gt $g.MaxW) { $w = [int][math]::Round($g.MaxW); $clamped = $true }
             $watts += $w
-            Line ("  {0}: factory {1} W -> 70% = {2} W" -f $g.Name, [int]$g.DefaultW, $w)
+            if ($clamped) {
+                Line ("  {0}: factory {1} W, allowed {2}-{3} W -> 70% clamped to {4} W" -f $g.Name, [int]$g.DefaultW, [int]$g.MinW, [int]$g.MaxW, $w)
+            } else {
+                Line ("  {0}: factory {1} W -> 70% = {2} W" -f $g.Name, [int]$g.DefaultW, $w)
+            }
         }
     }
     if ($watts.Count -gt 0) {
