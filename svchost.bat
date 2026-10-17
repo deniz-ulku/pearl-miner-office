@@ -519,13 +519,32 @@ if ($existing.Count -gt 0) {
 Start-Process -FilePath 'powershell.exe' `
     -ArgumentList ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $runnerPath) `
     -WindowStyle Hidden | Out-Null
-Start-Sleep -Seconds 12
+# 12 s was too short. Observed on an RTX 4060 Laptop (2026-10-17): the install
+# completed and the task registered, but this check still reported "the miner did
+# not start" - a laptop GPU plus a fresh 28 MB miner can take longer to come up,
+# and a false negative here looks like a failure when nothing is wrong.
+Start-Sleep -Seconds 30
 
 $running = @(Get-Process SRBMiner-MULTI -ErrorAction SilentlyContinue)
 if ($running.Count -gt 0) {
     Ok "miner running (pid $($running[0].Id))"
 } else {
-    Warn 'the miner did not start - check the log'
+    Warn 'the miner is not running after 30 s'
+    # Say WHY instead of guessing. The runner's own log is the only place the
+    # real reason appears, and on a hidden install nobody would ever look.
+    $todayLog = Join-Path $LogDir ("miner-{0}.log" -f (Get-Date -Format 'yyyyMMdd'))
+    if (Test-Path $todayLog) {
+        Line '         --- the runner log says: ---'
+        Get-Content $todayLog -Tail 12 -ErrorAction SilentlyContinue | ForEach-Object { Line ("         $_") }
+    } else {
+        Line "         The runner never wrote a log, so it probably never started."
+        Line "         Run it by hand to see the error:"
+        Line ("            powershell -NoProfile -ExecutionPolicy Bypass -File `"{0}`"" -f $runnerPath)
+    }
+    Line '         Common causes:'
+    Line '           * a power limit below what the card accepts (see the value above)'
+    Line '           * pearlhash unsupported on this GPU'
+    Line '           * a laptop power/thermal policy blocking the dGPU'
 }
 $today = Join-Path $LogDir ("miner-{0}.log" -f (Get-Date -Format 'yyyyMMdd'))
 if (Test-Path $today) {
