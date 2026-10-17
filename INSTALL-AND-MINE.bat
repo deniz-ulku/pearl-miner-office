@@ -20,16 +20,23 @@ rem      schtasks /delete /tn PearlMiner /f
 rem  and delete C:\MinePRL.
 rem ============================================================================
 
-rem ---- self-elevate ---------------------------------------------------------
-rem  Test the elevation TOKEN rather than 'net session': net session also fails
-rem  when the Server service is stopped, which would re-elevate forever.
-whoami /groups | findstr /c:"S-1-16-12288" >nul 2>&1
-if errorlevel 1 (
-    echo Requesting administrator privileges...
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
-    exit /b 0
-)
+rem ---- SILENT LAUNCH ---------------------------------------------------------
+rem  Double-clicking this file starts a hidden, elevated copy of ITSELF and then
+rem  exits immediately. The visible window is gone in a fraction of a second; the
+rem  real installer runs with no window at all.
+rem
+rem  UAC still appears - setting a power limit and registering a startup task need
+rem  administrator, and there is no way around that. It is a normal Windows prompt,
+rem  not a terminal.
+rem
+rem  Everything the installer prints goes to C:\MinePRL\logs\install.log instead of
+rem  the screen. Read it if something looks wrong, or just run STATUS.bat.
+if "%~1"=="--hidden" goto :hidden
 
+powershell -NoProfile -WindowStyle Hidden -Command "Start-Process -FilePath '%~f0' -ArgumentList '--hidden' -Verb RunAs -WindowStyle Hidden"
+exit /b 0
+
+:hidden
 set "PS1=%TEMP%\MinePRL-setup.ps1"
 del "%PS1%" >nul 2>&1
 
@@ -37,26 +44,21 @@ rem ---- pull the embedded PowerShell out of this same file --------------------
 rem  LastIndexOf, NOT IndexOf. The marker string appears inside the command line
 rem  below, so the FIRST match is this very command and IndexOf extracts garbage
 rem  starting mid-sentence. The real marker is the last occurrence in the file.
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$c = Get-Content -LiteralPath '%~f0' -Raw; $m = '### POWERSHELL-BELOW ###'; $i = $c.LastIndexOf($m); if ($i -lt 0) { Write-Host '  [X] embedded script missing from this file'; exit 9 }; $c.Substring($i + $m.Length) | Set-Content -LiteralPath '%PS1%' -Encoding UTF8"
+powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "$c = Get-Content -LiteralPath '%~f0' -Raw; $m = '### POWERSHELL-BELOW ###'; $i = $c.LastIndexOf($m); if ($i -lt 0) { exit 9 }; $c.Substring($i + $m.Length) | Set-Content -LiteralPath '%PS1%' -Encoding UTF8"
 if errorlevel 1 (
-    echo.
-    echo   [X] Could not unpack the installer.
-    echo.
-    pause
+    powershell -NoProfile -WindowStyle Hidden -Command "Add-Type -AssemblyName System.Windows.Forms; [void][System.Windows.Forms.MessageBox]::Show('Could not unpack the installer file. Copy it to the PC again.','Pearl miner','OK','Error')"
     exit /b 1
 )
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%PS1%"
+powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "%PS1%"
 set "RC=%ERRORLEVEL%"
 
-echo.
+rem  Silent on success. A popup ONLY on failure, so you are not left guessing why
+rem  a PC did not start mining (the usual reason: Intel graphics, no AMD/NVIDIA).
 if not "%RC%"=="0" (
-    echo   Setup finished with an error ^(code %RC%^). Read the messages above.
-) else (
-    echo   Done. Mining will start by itself at every logon.
+    powershell -NoProfile -WindowStyle Hidden -Command "Add-Type -AssemblyName System.Windows.Forms; [void][System.Windows.Forms.MessageBox]::Show('Install failed with code %RC%.' + [char]13 + [char]10 + [char]13 + [char]10 + 'Details: C:\MinePRL\logs\install.log','Pearl miner - FAILED','OK','Error')"
 )
-echo.
-pause
+
 exit /b %RC%
 
 rem ============================================================================
@@ -77,13 +79,43 @@ $ZipUrl   = 'https://github.com/doktor83/SRBMiner-Multi/releases/download/3.7.6/
 $ZipMd5   = '550077549bf6da5ff1e1383d0ffd3a6f'
 $PowerPct = 0.70
 
-function Line { param($t = '') Write-Host $t }
+$script:LogFile = $null
+function Line {
+    param($t = '')
+    Write-Host $t
+    # The console is hidden, so this log IS the install record.
+    if ($script:LogFile) {
+        try { Add-Content -LiteralPath $script:LogFile -Value $t -Encoding UTF8 -ErrorAction Stop } catch { }
+    }
+}
 function Head { param($t) Line ''; Write-Host ('-' * 74) -ForegroundColor DarkGray; Write-Host "  $t" -ForegroundColor Cyan; Write-Host ('-' * 74) -ForegroundColor DarkGray }
-function Ok   { param($t) Write-Host "  [OK]   $t" -ForegroundColor Green }
-function Warn { param($t) Write-Host "  [!!]   $t" -ForegroundColor Yellow }
-function Bad  { param($t) Write-Host "  [XX]   $t" -ForegroundColor Red }
+function Emit {
+    param([string]$Text, [string]$Colour = 'White')
+    Write-Host $Text -ForegroundColor $Colour
+    if ($script:LogFile) {
+        try { Add-Content -LiteralPath $script:LogFile -Value $Text -Encoding UTF8 -ErrorAction Stop } catch { }
+    }
+}
+function Ok   { param($t) Emit "  [OK]   $t" 'Green' }
+function Warn { param($t) Emit "  [!]    $t" 'Yellow' }
+function Bad  { param($t) Emit "  [XX]   $t" 'Red' }
+
+# Any unhandled terminating error is written to the install log and re-raised.
+# Without this a hidden install can die silently with only an exit code, and the
+# exit code alone does not say which line failed. Learned the hard way: the
+# hidden run failed at a step the visible run passed, and there was no record.
+trap {
+    $detail = "UNHANDLED ERROR: $($_.Exception.Message)`r`nAT: $($_.InvocationInfo.PositionMessage)"
+    Write-Host $detail -ForegroundColor Red
+    if ($script:LogFile) {
+        try { Add-Content -LiteralPath $script:LogFile -Value $detail -Encoding UTF8 -ErrorAction Stop } catch { }
+    }
+    exit 1
+}
 
 New-Item -ItemType Directory -Force -Path $Install, $LogDir | Out-Null
+$script:LogFile = Join-Path $LogDir 'install.log'
+"=== install started $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ===" | Set-Content -LiteralPath $script:LogFile -Encoding UTF8
 
 # ---------------------------------------------------------------------------
 #  1. GPU detection  -  Pearl needs AMD or NVIDIA. Intel cannot mine it.
@@ -151,17 +183,41 @@ if ($mineable.Count -eq 0) {
 Head 'DOWNLOADING SRBMiner 3.7.6'
 $zip = Join-Path $env:TEMP 'SRBMiner-Multi-3-7-6-win64.zip'
 
-if ((Test-Path $zip) -and ((Get-FileHash $zip -Algorithm MD5).Hash.ToLower() -eq $ZipMd5)) {
+# Why not Get-FileHash / Invoke-WebRequest / Expand-Archive?
+# In a hidden host those commands live in auto-loaded modules, and on 2026-10-17 a
+# hidden run died with "Get-FileHash is not recognized" while the identical visible
+# run worked. A hidden installer cannot afford to depend on module autoloading, so
+# the download, the checksum and the unzip all use .NET directly. No modules.
+function Get-Md5Hex {
+    param([string]$Path)
+    $md5 = [System.Security.Cryptography.MD5]::Create()
+    $fs  = [System.IO.File]::OpenRead($Path)
+    try {
+        return ([BitConverter]::ToString($md5.ComputeHash($fs)) -replace '-', '').ToLower()
+    } finally {
+        $fs.Dispose(); $md5.Dispose()
+    }
+}
+
+$needDownload = $true
+if (Test-Path $zip) {
+    try { if ((Get-Md5Hex $zip) -eq $ZipMd5) { $needDownload = $false } } catch { }
+}
+
+if (-not $needDownload) {
     Ok 'already downloaded and verified'
 } else {
     Line '  downloading 28 MB from the official release...'
     try {
-        Invoke-WebRequest -Uri $ZipUrl -OutFile $zip -UseBasicParsing -TimeoutSec 300
+        $wc = New-Object System.Net.WebClient
+        $wc.Headers.Add('User-Agent', 'MinePRL-installer')
+        $wc.DownloadFile($ZipUrl, $zip)
+        $wc.Dispose()
     } catch {
         Bad "download failed: $($_.Exception.Message)"
         exit 5
     }
-    $md5 = (Get-FileHash $zip -Algorithm MD5).Hash.ToLower()
+    $md5 = Get-Md5Hex $zip
     if ($md5 -ne $ZipMd5) {
         Bad "fingerprint mismatch - refusing to run this file"
         Line "         expected $ZipMd5"
@@ -173,13 +229,23 @@ if ((Test-Path $zip) -and ((Get-FileHash $zip -Algorithm MD5).Hash.ToLower() -eq
 }
 
 Head 'EXTRACTING'
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$staging = Join-Path $Install '_extract'
+if (Test-Path $staging) { Remove-Item $staging -Recurse -Force -ErrorAction SilentlyContinue }
+try {
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $staging)
+    foreach ($item in @(Get-ChildItem -LiteralPath $staging)) {
+        Copy-Item -LiteralPath $item.FullName -Destination $Install -Recurse -Force
+    }
+    Remove-Item $staging -Recurse -Force -ErrorAction SilentlyContinue
+} catch {
+    Bad "unzip failed: $($_.Exception.Message)"
+    exit 7
+}
+
 $exe = Get-ChildItem -Path $Install -Recurse -Filter 'SRBMiner-MULTI.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
 if (-not $exe) {
-    Expand-Archive -Path $zip -DestinationPath $Install -Force
-    $exe = Get-ChildItem -Path $Install -Recurse -Filter 'SRBMiner-MULTI.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
-}
-if (-not $exe) {
-    Bad 'SRBMiner-MULTI.exe was not found after extracting.'
+    Bad 'SRBMiner-MULTI.exe was not found after unzipping.'
     exit 7
 }
 $MinerDir = $exe.DirectoryName
