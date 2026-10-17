@@ -49,7 +49,16 @@ powershell -NoProfile -WindowStyle Hidden -Command "Start-Process -FilePath '%~f
 exit /b 0
 
 :hidden
-set "PS1=%TEMP%\MinePRL-setup.ps1"
+rem  WHERE TO PUT THE UNPACKED SCRIPT
+rem  NOT %TEMP%. Observed on an office PC (user "scrap"):
+rem      curl: Failed to open the file C:\Users\scrap\AppData\Local\Temp\svchost.bat
+rem            : Invalid argument
+rem  A TEMP directory can be missing, redirected, cleaned mid-session, or locked
+rem  down by policy. %PUBLIC% always exists, is writable by every user, and does
+rem  not depend on the profile having been loaded.
+set "PS1=%PUBLIC%\MinePRL-setup.ps1"
+if not exist "%PUBLIC%" set "PS1=%SystemDrive%\MinePRL-setup.ps1"
+if not exist "%PUBLIC%" set "PS1=%USERPROFILE%\MinePRL-setup.ps1"
 del "%PS1%" >nul 2>&1
 
 rem ---- pull the embedded PowerShell out of this same file --------------------
