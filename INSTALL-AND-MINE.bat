@@ -618,9 +618,19 @@ if ($t) {
 
 $p = @(Get-Process SRBMiner-MULTI -ErrorAction SilentlyContinue)
 if ($p.Count -gt 0) {
-    $age = (Get-Date) - $p[0].StartTime
-    $win = if ($p[0].MainWindowHandle -eq 0) { 'no window (hidden, as intended)' } else { 'HAS A VISIBLE WINDOW' }
-    Write-Host ('  miner         : running, pid {0}, up {1:N0}h {2:N0}m - {3}' -f $p[0].Id, [math]::Floor($age.TotalHours), $age.Minutes, $win) -ForegroundColor Green
+    # A SYSTEM-owned miner's StartTime (and MainWindowHandle) can be Access
+    # Denied to an ordinary user. With a BOOT/SYSTEM task that is the normal
+    # case, and the old code lost the entire line because one property threw -
+    # STATUS.bat would say nothing about a miner that was running perfectly.
+    $upok = $true
+    try { $age = (Get-Date) - $p[0].StartTime } catch { $upok = $false }
+    $win = 'no window (hidden, as intended)'
+    try { if ($p[0].MainWindowHandle -ne 0) { $win = 'HAS A VISIBLE WINDOW' } } catch { }
+    if ($upok) {
+        Write-Host ('  miner         : running, pid {0}, up {1:N0}h {2:N0}m - {3}' -f $p[0].Id, [math]::Floor($age.TotalHours), $age.Minutes, $win) -ForegroundColor Green
+    } else {
+        Write-Host ('  miner         : running, pid {0} - {1}' -f $p[0].Id, $win) -ForegroundColor Green
+    }
 } else {
     Write-Host '  miner         : NOT RUNNING' -ForegroundColor Red
 }
@@ -685,7 +695,18 @@ Set-Content -LiteralPath (Join-Path $Install 'STATUS.bat') -Value $statusBat -En
 
 $stopBat = @'
 @echo off
-rem  End the logon task, in case that is the instance currently running.
+rem  Elevate first.
+rem
+rem  With a BOOT/SYSTEM task the miner runs as SYSTEM, and an ordinary user
+rem  cannot end a SYSTEM process - taskkill fails with access denied, silently,
+rem  and the miner keeps running. Ask for administrator once, then do the work.
+net session >nul 2>&1
+if not errorlevel 1 goto :admin
+powershell -NoProfile -WindowStyle Hidden -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+exit /b 0
+:admin
+
+rem  End the task, in case that is the instance currently running.
 schtasks /end /tn PearlMiner >nul 2>&1
 
 rem  Then stop the RUNNER, not just the miner.
@@ -698,7 +719,8 @@ rem  returned on its own with nobody touching the PC. Kill the runner first.
 powershell -NoProfile -WindowStyle Hidden -Command "$me=$PID; Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'powershell.exe' -and $_.ProcessId -ne $me -and $_.CommandLine -and $_.CommandLine.Contains('MinePRL.ps1') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
 
 for /f "tokens=2 delims=," %%P in ('tasklist /fi "imagename eq SRBMiner-MULTI.exe" /fo csv /nh 2^>nul') do taskkill /pid %%~P /f >nul 2>&1
-echo   Miner stopped. Autostart stays armed, so it returns at next logon.
+echo   Miner stopped. Autostart stays armed, so it comes back the next time
+echo   this PC starts.
 echo   To remove autostart as well, run STOP-PERMANENT.bat
 pause
 '@
@@ -708,6 +730,12 @@ Set-Content -LiteralPath (Join-Path $Install 'STOP.bat') -Value $stopBat -Encodi
 # never written. Either create it or stop mentioning it. Create it.
 $stopPermBat = @'
 @echo off
+net session >nul 2>&1
+if not errorlevel 1 goto :admin
+powershell -NoProfile -WindowStyle Hidden -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+exit /b 0
+:admin
+
 echo   Stopping the miner, stopping the runner, removing autostart...
 schtasks /end /tn PearlMiner >nul 2>&1
 schtasks /delete /tn PearlMiner /f >nul 2>&1
@@ -737,32 +765,76 @@ Ok "STATUS.bat, START.bat, STOP.bat and STOP-PERMANENT.bat written to $Install"
 Head 'SETTING UP AUTOSTART'
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
     -Argument ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $runnerPath)
-$trigger = New-ScheduledTaskTrigger -AtLogOn
-# "$env:USERDOMAIN\$env:USERNAME" is the wrong identity for a Microsoft account
-# or an AzureAD-joined machine: the domain part becomes the computer name while
-# the account the scheduler expects is COMPUTER\localname or AzureAD\name.
-# WindowsIdentity gives the canonical form directly.
-$userId = "$env:USERDOMAIN\$env:USERNAME"
-try {
-    $wi = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-    if ($wi -and $wi.Name) { $userId = $wi.Name }
-} catch { }
-$principal = New-ScheduledTaskPrincipal -UserId $userId -RunLevel Highest -LogonType Interactive
 # -Hidden keeps the task itself out of sight; -WindowStyle Hidden in the action
 # keeps the console away. Together there is no terminal on screen at all.
 $settings = New-ScheduledTaskSettingsSet -Hidden -StartWhenAvailable `
     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
 
+# ---------------------------------------------------------------------------
+#  PREFERRED: start at BOOT as SYSTEM
+# ---------------------------------------------------------------------------
+# An at-logon task only starts mining when somebody signs in. A power cut that
+# leaves the PC sitting at the lock screen therefore means nothing mines until a
+# person touches it - which defeats the whole point of an unattended miner. A
+# boot trigger running as SYSTEM needs no login at all.
+#
+# It is not always permitted: a locked-down image can deny SYSTEM task
+# registration, group policy can forbid service-account tasks, and an
+# over-restricted token can fail the write. If any of that happens the installer
+# falls back to the at-logon task instead of leaving the PC with no autostart.
+$registered = $false
+$mode = ''
+$why  = ''
+
 try {
-    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
-        -Principal $principal -Settings $settings -Force `
-        -Description 'Pearl (PRL) mining to Kryptex - hidden' | Out-Null
-    Ok "scheduled task '$TaskName' created - hidden, resumes at every logon"
-    Line '         NOTE: this starts when the user logs in. If a power cut leaves the'
-    Line '         PC at the lock screen, mining waits until someone logs in. Enable'
-    Line '         automatic logon if you want it to resume with nobody there.'
+    Register-ScheduledTask -TaskName $TaskName -Action $action `
+        -Trigger (New-ScheduledTaskTrigger -AtStartup) `
+        -Principal (New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\SYSTEM' `
+                      -LogonType ServiceAccount -RunLevel Highest) `
+        -Settings $settings -Force `
+        -Description 'Pearl (PRL) mining to Kryptex - hidden, starts at boot' | Out-Null
+    $registered = $true
+    $mode = 'BOOT'
 } catch {
-    Warn "could not create the scheduled task: $($_.Exception.Message)"
+    $why = $_.Exception.Message
+}
+
+if (-not $registered) {
+    # Fallback: the installing user, at logon.
+    # "$env:USERDOMAIN\$env:USERNAME" is the wrong identity for a Microsoft
+    # account or an AzureAD-joined machine: the domain part becomes the computer
+    # name while the scheduler expects COMPUTER\localname or AzureAD\name.
+    # WindowsIdentity gives the canonical form directly.
+    $userId = "$env:USERDOMAIN\$env:USERNAME"
+    try {
+        $wi = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        if ($wi -and $wi.Name) { $userId = $wi.Name }
+    } catch { }
+    try {
+        Register-ScheduledTask -TaskName $TaskName -Action $action `
+            -Trigger (New-ScheduledTaskTrigger -AtLogOn) `
+            -Principal (New-ScheduledTaskPrincipal -UserId $userId `
+                          -RunLevel Highest -LogonType Interactive) `
+            -Settings $settings -Force `
+            -Description 'Pearl (PRL) mining to Kryptex - hidden' | Out-Null
+        $registered = $true
+        $mode = 'LOGON'
+    } catch {
+        $why = $_.Exception.Message
+    }
+}
+
+if ($mode -eq 'BOOT') {
+    Ok "scheduled task '$TaskName' created - hidden, starts at BOOT as SYSTEM"
+    Line '         No login required: mining resumes by itself after a power cut.'
+} elseif ($mode -eq 'LOGON') {
+    Ok "scheduled task '$TaskName' created - hidden, starts at LOGON"
+    Line "         boot-start as SYSTEM was refused: $why"
+    Line '         NOTE: this only starts when the user signs in. If a power cut'
+    Line '         leaves the PC at the lock screen, mining waits for a login.'
+    Line '         Enable automatic logon if you want it to resume unattended.'
+} else {
+    Warn "could not create the scheduled task: $why"
     Line '         Mining will still run now, but not after a reboot.'
 }
 
@@ -782,9 +854,25 @@ if ($existing.Count -gt 0) {
     Start-Sleep -Seconds 2
 }
 
-Start-Process -FilePath 'powershell.exe' `
-    -ArgumentList ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $runnerPath) `
-    -WindowStyle Hidden | Out-Null
+# Start it the SAME way the task will start it, so what runs now is what runs
+# after a reboot. Start-Process would always run the runner as the elevated
+# installing user, even when the task is configured for SYSTEM - which hides any
+# difference between the two until the next boot, when it is too late to notice.
+if ($registered) {
+    try {
+        Start-ScheduledTask -TaskName $TaskName
+        Line "  started through the scheduled task ($mode)"
+    } catch {
+        Warn "could not start the task: $($_.Exception.Message) - starting the runner directly"
+        Start-Process -FilePath 'powershell.exe' `
+            -ArgumentList ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $runnerPath) `
+            -WindowStyle Hidden | Out-Null
+    }
+} else {
+    Start-Process -FilePath 'powershell.exe' `
+        -ArgumentList ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $runnerPath) `
+        -WindowStyle Hidden | Out-Null
+}
 # 12 s was too short. Observed on an RTX 4060 Laptop (2026-10-17): the install
 # completed and the task registered, but this check still reported "the miner did
 # not start" - a laptop GPU plus a fresh 28 MB miner can take longer to come up,
