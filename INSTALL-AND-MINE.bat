@@ -400,13 +400,22 @@ try {
         # that directory does not overwrite it - it nests a second copy inside:
         #     C:\MinePRL\SRBMiner-Multi-3-7-6\SRBMiner-Multi-3-7-6\...
         # Every reinstall doubled the tree and left a STALE exe that the search
-        # below could pick instead of the new one. Remove, then copy.
-        $dest = Join-Path $Install $item.Name
+        # below could pick instead of the new one.
+        #
+        # If the remove fails the folder is IN USE (the miner is running from it),
+        # and copying anyway is what creates the duplicate. Skip that item instead.
+        $dest   = Join-Path $Install $item.Name
+        $skip   = $false
         if (Test-Path -LiteralPath $dest) {
             try { Remove-Item -LiteralPath $dest -Recurse -Force -ErrorAction Stop }
-            catch { Warn "could not replace $dest (in use) - reusing the copy already there" }
+            catch {
+                Warn "could not replace $($item.Name) (in use) - keeping the copy already there, not nesting a duplicate"
+                $skip = $true
+            }
         }
-        Copy-Item -LiteralPath $item.FullName -Destination $Install -Recurse -Force
+        if (-not $skip) {
+            Copy-Item -LiteralPath $item.FullName -Destination $Install -Recurse -Force
+        }
     }
     Remove-Item $staging -Recurse -Force -ErrorAction SilentlyContinue
 } catch {
