@@ -158,3 +158,10 @@ Two bugs were found and fixed during testing:
 Miner: [SRBMiner-Multi](https://github.com/doktor83/SRBMiner-Multi) by doktor83 —
 downloaded from the official release, never bundled here, so you always get a
 version whose fingerprint you can check.
+
+
+---
+
+## Two names, one file
+
+`INSTALL-AND-MINE.bat` and `svchost.bat` are byte-identical copies of the same installer. Use whichever name you prefer - both download URLs point at the same build.

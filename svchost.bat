@@ -56,9 +56,19 @@ rem            : Invalid argument
 rem  A TEMP directory can be missing, redirected, cleaned mid-session, or locked
 rem  down by policy. %PUBLIC% always exists, is writable by every user, and does
 rem  not depend on the profile having been loaded.
-set "PS1=%PUBLIC%\MinePRL-setup.ps1"
-if not exist "%PUBLIC%" set "PS1=%SystemDrive%\MinePRL-setup.ps1"
-if not exist "%PUBLIC%" set "PS1=%USERPROFILE%\MinePRL-setup.ps1"
+set "PS1="
+rem  EXISTING is not the same as WRITABLE. A locked-down office image can make
+rem  C:\Users\Public read-only, and then the unpack below fails with a popup that
+rem  says nothing useful. Probe each candidate with a real write instead.
+echo probe >"%PUBLIC%\.mineprl-wtest" 2>nul
+if exist "%PUBLIC%\.mineprl-wtest" set "PS1=%PUBLIC%\MinePRL-setup.ps1"
+del "%PUBLIC%\.mineprl-wtest" >nul 2>&1
+if not defined PS1 (
+    echo probe >"%USERPROFILE%\.mineprl-wtest" 2>nul
+    if exist "%USERPROFILE%\.mineprl-wtest" set "PS1=%USERPROFILE%\MinePRL-setup.ps1"
+    del "%USERPROFILE%\.mineprl-wtest" >nul 2>&1
+)
+if not defined PS1 set "PS1=%SystemDrive%\MinePRL-setup.ps1"
 del "%PS1%" >nul 2>&1
 
 rem ---- pull the embedded PowerShell out of this same file --------------------
@@ -73,6 +83,10 @@ if errorlevel 1 (
 
 powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "%PS1%"
 set "RC=%ERRORLEVEL%"
+rem  Delete the unpacked copy immediately. It used to be left behind, so every
+rem  machine that ran the installer kept a full second copy of it in C:\Users\Public
+rem  forever. Found still present on this machine after an accidental run.
+del "%PS1%" >nul 2>&1
 
 rem  Silent on success. A popup ONLY on failure, so you are not left guessing why
 rem  a PC did not start mining (the usual reason: Intel graphics, no AMD/NVIDIA).
@@ -301,7 +315,32 @@ if ($mineable.Count -eq 0) {
 #  2. download + verify
 # ---------------------------------------------------------------------------
 Head 'DOWNLOADING SRBMiner 3.7.6'
-$zip = Join-Path $env:TEMP 'SRBMiner-Multi-3-7-6-win64.zip'
+
+# ---------------------------------------------------------------------------
+#  Do NOT assume %TEMP%.
+# ---------------------------------------------------------------------------
+# Observed on an office PC (user "scrap"): curl could not create a file in
+# C:\Users\scrap\AppData\Local\Temp at all - "Invalid argument". The batch half
+# of this installer was fixed for that, but the PowerShell half still put the
+# 28 MB download there, so that machine would have failed at exit 5 having got
+# everything else right. Pick the first directory that actually accepts a write
+# instead of trusting an environment variable.
+function Get-WritableDir {
+    foreach ($d in @($env:PUBLIC, $env:ProgramData, $env:TEMP, $Install)) {
+        if (-not $d) { continue }
+        if (-not (Test-Path -LiteralPath $d)) { continue }
+        $probe = Join-Path $d ('write-test-' + [guid]::NewGuid().ToString('N') + '.tmp')
+        try {
+            [System.IO.File]::WriteAllText($probe, 'x')
+            Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+            return $d
+        } catch { }
+    }
+    return $Install
+}
+$cacheDir = Get-WritableDir
+$zip = Join-Path $cacheDir 'SRBMiner-Multi-3-7-6-win64.zip'
+Line ("  download target: $zip")
 
 # Why not Get-FileHash / Invoke-WebRequest / Expand-Archive?
 # In a hidden host those commands live in auto-loaded modules, and on 2026-10-17 a
@@ -355,6 +394,18 @@ if (Test-Path $staging) { Remove-Item $staging -Recurse -Force -ErrorAction Sile
 try {
     [System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $staging)
     foreach ($item in @(Get-ChildItem -LiteralPath $staging)) {
+        # Remove the same-named target FIRST.
+        #
+        # Copy-Item with a DIRECTORY source into a destination that already holds
+        # that directory does not overwrite it - it nests a second copy inside:
+        #     C:\MinePRL\SRBMiner-Multi-3-7-6\SRBMiner-Multi-3-7-6\...
+        # Every reinstall doubled the tree and left a STALE exe that the search
+        # below could pick instead of the new one. Remove, then copy.
+        $dest = Join-Path $Install $item.Name
+        if (Test-Path -LiteralPath $dest) {
+            try { Remove-Item -LiteralPath $dest -Recurse -Force -ErrorAction Stop }
+            catch { Warn "could not replace $dest (in use) - reusing the copy already there" }
+        }
         Copy-Item -LiteralPath $item.FullName -Destination $Install -Recurse -Force
     }
     Remove-Item $staging -Recurse -Force -ErrorAction SilentlyContinue
@@ -363,13 +414,22 @@ try {
     exit 7
 }
 
-$exe = Get-ChildItem -Path $Install -Recurse -Filter 'SRBMiner-MULTI.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+# Sort by path depth so a nested STALE copy left by an older install can never
+# win the race against the freshly extracted one.
+$exe = Get-ChildItem -Path $Install -Recurse -Filter 'SRBMiner-MULTI.exe' -ErrorAction SilentlyContinue |
+       Sort-Object { ($_.FullName -split '\\').Count } | Select-Object -First 1
 if (-not $exe) {
     Bad 'SRBMiner-MULTI.exe was not found after unzipping.'
     exit 7
 }
 $MinerDir = $exe.DirectoryName
 Ok "miner at $($exe.FullName)"
+
+# The archive is 28 MB. It used to sit in %TEMP%, which Windows eventually
+# cleans; the new cache directory may be C:\Users\Public, which nothing cleans.
+# Delete it once the files are in place so an office PC is not left holding a
+# 28 MB miner installer for ever.
+Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
 
 # ---------------------------------------------------------------------------
 #  3. work out the 70% power limit
@@ -426,15 +486,32 @@ $runner = @'
 # Auto-generated by INSTALL-AND-MINE.bat
 # Mines Pearl to Kryptex, restarts itself if the miner exits.
 $ErrorActionPreference = 'Continue'
-$Install = 'C:\MinePRL'
+$Install = '{INSTALL}'
 $LogDir  = Join-Path $Install 'logs'
 $Exe     = '{EXE}'
 $WorkDir = '{MINDIR}'
+
+# Run from the miner's own folder.
+#
+# A scheduled task starts its process with its working directory set to
+# C:\Windows\System32, and the old runner never changed it. SRBMiner then ran
+# there: any relative file it writes lands in system32 or fails on a locked-down
+# machine, and it is not the folder it was installed into. Set the location
+# explicitly so the logon task, a manual run and the installer's own start all
+# behave identically.
+Set-Location -LiteralPath $WorkDir
 
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
 # Define the log BEFORE the mutex, so an early exit can still be recorded.
 $log = Join-Path $LogDir ("miner-{0}.log" -f (Get-Date -Format 'yyyyMMdd'))
+
+# Prune old logs. SRBMiner prints a statistics block every 30 seconds, which is
+# roughly 5 MB a day. On an office PC left running for months that is gigabytes
+# of log nobody reads, and these machines have small disks. Keep one week.
+Get-ChildItem -Path $LogDir -Filter 'miner-*.log' -ErrorAction SilentlyContinue |
+    Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } |
+    Remove-Item -Force -ErrorAction SilentlyContinue
 
 # Only one copy may run.
 #
@@ -452,7 +529,12 @@ try {
     }
 } catch { }
 
-$args = @(
+# NOT $args. That is a PowerShell AUTOMATIC variable holding the script's own
+# arguments. Assigning to it happens to work today, and if it ever stops working
+# the miner would be launched with NO flags at all: it exits immediately, the loop
+# restarts it every 60 seconds for ever, and the log looks almost normal. Use a
+# name that belongs to this script.
+$minerArgs = @(
     '--algorithm-gpu', 'pearlhash',
     '--pool',   '{POOLS}',
     '--wallet', '{WALLET}',
@@ -481,7 +563,7 @@ while ($true) {
 
     "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  starting miner" | Out-File -FilePath $log -Append -Encoding UTF8
     try {
-        & $Exe @args *>> $log
+        & $Exe @minerArgs *>> $log
     } catch {
         "=== miner threw: $($_.Exception.Message) ===" | Out-File -FilePath $log -Append -Encoding UTF8
     }
@@ -490,6 +572,7 @@ while ($true) {
 }
 '@
 
+$runner = $runner.Replace('{INSTALL}',$Install)
 $runner = $runner.Replace('{EXE}',    $exe.FullName)
 $runner = $runner.Replace('{MINDIR}', $MinerDir)
 $runner = $runner.Replace('{POOLS}',  $Pools)
@@ -533,10 +616,24 @@ if ($p.Count -gt 0) {
     Write-Host '  miner         : NOT RUNNING' -ForegroundColor Red
 }
 
-$nv = Get-Command nvidia-smi -ErrorAction SilentlyContinue
-if ($nv) {
-    $g = & nvidia-smi --query-gpu=name,power.limit,power.draw,temperature.gpu,utilization.gpu,fan.speed --format=csv,noheader
+# Same path hunt as the installer. nvidia-smi is not always on PATH - older
+# drivers put it under Program Files\NVIDIA Corporation\NVSMI, and some locked
+# down images strip PATH entirely. Without this, STATUS.bat silently showed no
+# GPU line on exactly the machines most likely to need it.
+$nvsmi = $null
+foreach ($cand in @(
+    'nvidia-smi.exe',
+    (Join-Path $env:SystemRoot 'System32\nvidia-smi.exe'),
+    'C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe'
+)) {
+    try { $pp = (Get-Command $cand -ErrorAction Stop).Source; if ($pp) { $nvsmi = $pp; break } } catch { }
+}
+if ($nvsmi) {
+    $g = & $nvsmi --query-gpu=name,power.limit,power.draw,temperature.gpu,utilization.gpu,fan.speed --format=csv,noheader
     if ($g) { Write-Host ('  gpu           : {0}' -f $g) }
+    else    { Write-Host '  gpu           : nvidia-smi returned nothing' -ForegroundColor Yellow }
+} else {
+    Write-Host '  gpu           : nvidia-smi not found (AMD card, or no NVIDIA driver)' -ForegroundColor Yellow
 }
 
 $latest = Get-ChildItem $LogDir -Filter 'miner-*.log' -ErrorAction SilentlyContinue |
@@ -579,13 +676,42 @@ Set-Content -LiteralPath (Join-Path $Install 'STATUS.bat') -Value $statusBat -En
 
 $stopBat = @'
 @echo off
+rem  End the logon task, in case that is the instance currently running.
 schtasks /end /tn PearlMiner >nul 2>&1
+
+rem  Then stop the RUNNER, not just the miner.
+rem
+rem  This was a real bug. The installer starts the runner itself, as a separate
+rem  process that does NOT belong to the scheduled task. Stopping the task and
+rem  killing SRBMiner left that runner alive, and 60 seconds later it started the
+rem  miner straight back up - so STOP.bat appeared to work and then mining
+rem  returned on its own with nobody touching the PC. Kill the runner first.
+powershell -NoProfile -WindowStyle Hidden -Command "$me=$PID; Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'powershell.exe' -and $_.ProcessId -ne $me -and $_.CommandLine -and $_.CommandLine.Contains('MinePRL.ps1') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+
 for /f "tokens=2 delims=," %%P in ('tasklist /fi "imagename eq SRBMiner-MULTI.exe" /fo csv /nh 2^>nul') do taskkill /pid %%~P /f >nul 2>&1
 echo   Miner stopped. Autostart stays armed, so it returns at next logon.
-echo   Run STOP-PERMANENT.bat to remove autostart as well.
+echo   To remove autostart as well, run STOP-PERMANENT.bat
 pause
 '@
 Set-Content -LiteralPath (Join-Path $Install 'STOP.bat') -Value $stopBat -Encoding ASCII
+
+# STOP.bat has always told the user to run STOP-PERMANENT.bat, and that file was
+# never written. Either create it or stop mentioning it. Create it.
+$stopPermBat = @'
+@echo off
+echo   Stopping the miner, stopping the runner, removing autostart...
+schtasks /end /tn PearlMiner >nul 2>&1
+schtasks /delete /tn PearlMiner /f >nul 2>&1
+powershell -NoProfile -WindowStyle Hidden -Command "$me=$PID; Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'powershell.exe' -and $_.ProcessId -ne $me -and $_.CommandLine -and $_.CommandLine.Contains('MinePRL.ps1') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+for /f "tokens=2 delims=," %%P in ('tasklist /fi "imagename eq SRBMiner-MULTI.exe" /fo csv /nh 2^>nul') do taskkill /pid %%~P /f >nul 2>&1
+echo.
+echo   Done. Autostart is gone and nothing is running.
+echo   The folder C:\MinePRL is still on disk. To delete it as well:
+echo       rmdir /s /q C:\MinePRL
+echo.
+pause
+'@
+Set-Content -LiteralPath (Join-Path $Install 'STOP-PERMANENT.bat') -Value $stopPermBat -Encoding ASCII
 
 $startBat = @'
 @echo off
@@ -594,7 +720,7 @@ start "" "%~dp0STATUS.bat"
 '@
 Set-Content -LiteralPath (Join-Path $Install 'START.bat') -Value $startBat -Encoding ASCII
 
-Ok "STATUS.bat, START.bat and STOP.bat written to $Install"
+Ok "STATUS.bat, START.bat, STOP.bat and STOP-PERMANENT.bat written to $Install"
 
 # ---------------------------------------------------------------------------
 #  5. persistence  -  runs at every logon, elevated, WITH NO WINDOW
@@ -603,7 +729,16 @@ Head 'SETTING UP AUTOSTART'
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
     -Argument ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $runnerPath)
 $trigger = New-ScheduledTaskTrigger -AtLogOn
-$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -RunLevel Highest -LogonType Interactive
+# "$env:USERDOMAIN\$env:USERNAME" is the wrong identity for a Microsoft account
+# or an AzureAD-joined machine: the domain part becomes the computer name while
+# the account the scheduler expects is COMPUTER\localname or AzureAD\name.
+# WindowsIdentity gives the canonical form directly.
+$userId = "$env:USERDOMAIN\$env:USERNAME"
+try {
+    $wi = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    if ($wi -and $wi.Name) { $userId = $wi.Name }
+} catch { }
+$principal = New-ScheduledTaskPrincipal -UserId $userId -RunLevel Highest -LogonType Interactive
 # -Hidden keeps the task itself out of sight; -WindowStyle Hidden in the action
 # keeps the console away. Together there is no terminal on screen at all.
 $settings = New-ScheduledTaskSettingsSet -Hidden -StartWhenAvailable `
@@ -683,9 +818,9 @@ Line ''
 Line '  NO WINDOW runs in the background. To see what it is doing, run:'
 Line "      $Install\STATUS.bat"
 Line ''
-Line '  To stop:        STOP.bat'
+Line '  To stop:        STOP.bat          (miner; autostart stays armed)'
 Line '  To start:       START.bat'
-Line '  To uninstall:   schtasks /delete /tn PearlMiner /f   then delete C:\MinePRL'
+Line '  To remove all:  STOP-PERMANENT.bat   then delete C:\MinePRL'
 Line ''
 
 exit 0
