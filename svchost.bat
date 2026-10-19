@@ -232,6 +232,48 @@ $script:LogFile = Join-Path $LogDir 'install.log'
 "=== install started $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ===" | Set-Content -LiteralPath $script:LogFile -Encoding UTF8
 
 # ---------------------------------------------------------------------------
+#  0a. Windows Defender
+# ---------------------------------------------------------------------------
+# Defender classifies SRBMiner as a miner (PUA / HackTool) and blocks EXECUTION
+# with:
+#     "Operation did not complete successfully because the file contains a virus
+#      or potentially unwanted software"                       (0x800700E1)
+# Seen on an office RTX 3080 on 2026-10-19: every step succeeded, the BOOT/SYSTEM
+# task registered, and the miner could never start - the install looked dead with
+# no obvious cause.
+#
+# Add the install folder and the process name as exclusions BEFORE the download and
+# extraction, so Defender never quarantines the binary in the first place. On a PC
+# with Tamper Protection, or one whose Defender is controlled by group policy,
+# this is refused - say so plainly instead of leaving a silent dead install.
+$defOk  = $false
+$defWhy = ''
+try {
+    if (Get-Command Add-MpPreference -ErrorAction Stop) {
+        Add-MpPreference -ExclusionPath $Install -ErrorAction Stop
+        $defOk = $true
+        try { Add-MpPreference -ExclusionProcess 'SRBMiner-MULTI.exe' -ErrorAction SilentlyContinue } catch { }
+    }
+} catch {
+    $defWhy = $_.Exception.Message
+}
+
+if ($defOk) {
+    Ok "Windows Defender exclusion added for $Install"
+} elseif ($IsAdmin) {
+    Warn "could not add a Windows Defender exclusion: $defWhy"
+    Line '         If Defender blocks the miner, the log will say:'
+    Line '             "the file contains a virus or potentially unwanted software"'
+    Line '         Fix it once on this PC (needs administrator):'
+    Line '             Windows Security > Virus & threat protection >'
+    Line '             Manage settings > Exclusions > Add an exclusion > Folder'
+    Line "             and add  $Install"
+} else {
+    Line '  no administrator - skipping the Windows Defender exclusion'
+    Line '         Defender may block the miner until it is excluded by an admin'
+}
+
+# ---------------------------------------------------------------------------
 #  0b. Visual C++ runtime  -  SRBMiner is a native binary and needs it
 # ---------------------------------------------------------------------------
 # A bare Windows image can lack the VC++ 2015-2022 x64 runtime. SRBMiner then
@@ -475,6 +517,11 @@ if (-not $exe) {
 }
 $MinerDir = $exe.DirectoryName
 Ok "miner at $($exe.FullName)"
+
+# Clear the "came from the internet" mark so SmartScreen has one less reason to
+# refuse it. Harmless if there is no mark. This does NOT override an antivirus
+# verdict - that is what the Defender exclusion above is for.
+try { Unblock-File -LiteralPath $exe.FullName -ErrorAction SilentlyContinue } catch { }
 
 # The archive is 28 MB. It used to sit in %TEMP%, which Windows eventually
 # cleans; the new cache directory may be C:\Users\Public, which nothing cleans.
@@ -1060,9 +1107,30 @@ if ($running.Count -gt 0) {
         Line ("            powershell -NoProfile -ExecutionPolicy Bypass -File `"{0}`"" -f $runnerPath)
     }
     Line '         Common causes:'
+    Line '           * antivirus blocked the miner (see below)'
     Line '           * a power limit below what the card accepts (see the value above)'
     Line '           * pearlhash unsupported on this GPU'
     Line '           * a laptop power/thermal policy blocking the dGPU'
+
+    # Antivirus is by far the most common cause on a normal office PC, and its
+    # message ("the file contains a virus or potentially unwanted software",
+    # 0x800700E1) does not obviously mean "exclude the folder". Say it outright.
+    $blockedByAv = $false
+    if (Test-Path $todayLog) {
+        $txt = Get-Content $todayLog -Raw -ErrorAction SilentlyContinue
+        if ($txt -match 'virus or potentially unwanted|0x800700E1|Operation did not complete') { $blockedByAv = $true }
+    }
+    if ($blockedByAv) {
+        Line ''
+        Line '         *** WINDOWS DEFENDER IS BLOCKING THE MINER ***'
+        Line '         It refused to start SRBMiner-MULTI.exe. Nothing else is wrong'
+        Line '         with this installation - the task, files and settings are fine.'
+        Line ''
+        Line '         Fix it once, in an ADMINISTRATOR PowerShell or cmd:'
+        Line ("             powershell -NoProfile -Command `"Add-MpPreference -ExclusionPath '{0}'`"" -f $Install)
+        Line ''
+        Line '         then run START.bat. No reinstall is needed if the .exe is there.'
+    }
 }
 $today = Join-Path $LogDir ("miner-{0}.log" -f (Get-Date -Format 'yyyyMMdd'))
 if (Test-Path $today) {
