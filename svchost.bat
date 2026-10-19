@@ -758,12 +758,19 @@ rem
 rem  With a BOOT/SYSTEM task the miner runs as SYSTEM, and an ordinary user
 rem  cannot end a SYSTEM process - taskkill fails with access denied, silently,
 rem  and the miner keeps running. Ask for administrator once, then do the work.
-net session >nul 2>&1
+rem  Elevation check uses the TOKEN, not "net session".
+rem
+rem  "net session" also fails when the Server service is stopped or disabled,
+rem  which has nothing to do with being an administrator. On such a PC this bat
+rem  would think it was not elevated, launch itself again, think the same thing
+rem  again, and spawn windows for ever. The desktop launcher already learned this
+rem  the hard way; do it the same way here.
+whoami /groups | findstr /c:"S-1-16-12288" >nul 2>&1
 if not errorlevel 1 goto :admin
-rem  Try to elevate. If UAC is DECLINED, carry on without it rather than doing
-rem  nothing at all: a USER-mode miner belongs to this user and can still be
-rem  stopped. Only a SYSTEM-owned miner needs the elevation, and in that case the
-rem  taskkill below simply fails - which is visible, not silent.
+rem  Genuinely not elevated. Ask once. If UAC is DECLINED, carry on without it
+rem  rather than doing nothing: a USER-mode miner belongs to this user and can
+rem  still be stopped. Only a SYSTEM-owned miner needs the elevation, and in that
+rem  case the taskkill below simply fails - which is visible, not silent.
 powershell -NoProfile -WindowStyle Hidden -Command "try { Start-Process -FilePath '%~f0' -Verb RunAs -ErrorAction Stop; exit 0 } catch { exit 1 }"
 if not errorlevel 1 exit /b 0
 :admin
@@ -792,12 +799,19 @@ Set-Content -LiteralPath (Join-Path $Install 'STOP.bat') -Value $stopBat -Encodi
 # never written. Either create it or stop mentioning it. Create it.
 $stopPermBat = @'
 @echo off
-net session >nul 2>&1
+rem  Elevation check uses the TOKEN, not "net session".
+rem
+rem  "net session" also fails when the Server service is stopped or disabled,
+rem  which has nothing to do with being an administrator. On such a PC this bat
+rem  would think it was not elevated, launch itself again, think the same thing
+rem  again, and spawn windows for ever. The desktop launcher already learned this
+rem  the hard way; do it the same way here.
+whoami /groups | findstr /c:"S-1-16-12288" >nul 2>&1
 if not errorlevel 1 goto :admin
-rem  Try to elevate. If UAC is DECLINED, carry on without it rather than doing
-rem  nothing at all: a USER-mode miner belongs to this user and can still be
-rem  stopped. Only a SYSTEM-owned miner needs the elevation, and in that case the
-rem  taskkill below simply fails - which is visible, not silent.
+rem  Genuinely not elevated. Ask once. If UAC is DECLINED, carry on without it
+rem  rather than doing nothing: a USER-mode miner belongs to this user and can
+rem  still be stopped. Only a SYSTEM-owned miner needs the elevation, and in that
+rem  case the taskkill below simply fails - which is visible, not silent.
 powershell -NoProfile -WindowStyle Hidden -Command "try { Start-Process -FilePath '%~f0' -Verb RunAs -ErrorAction Stop; exit 0 } catch { exit 1 }"
 if not errorlevel 1 exit /b 0
 :admin
