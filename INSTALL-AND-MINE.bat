@@ -95,9 +95,18 @@ del "%PS1%" >nul 2>&1
 
 rem  Silent on success. A popup ONLY on failure, so you are not left guessing why
 rem  a PC did not start mining (the usual reason: Intel graphics, no AMD/NVIDIA).
-if not "%RC%"=="0" (
-    powershell -NoProfile -WindowStyle Hidden -Command "Add-Type -AssemblyName System.Windows.Forms; [void][System.Windows.Forms.MessageBox]::Show('Install failed with code %RC%.' + [char]13 + [char]10 + [char]13 + [char]10 + 'Details: C:\MinePRL\logs\install.log','Pearl miner - FAILED','OK','Error')"
-)
+rem
+rem  The log lives in C:\MinePRL for an admin install and in %LOCALAPPDATA% for a
+rem  user install. Point the popup at whichever one actually exists - it always
+rem  named C:\MinePRL before, which sends people to a path that is not there.
+rem
+rem  NOT inside a ( ) block: %LOGPATH% would be expanded when the block is parsed,
+rem  before the set runs, and come out empty. Jump instead.
+if "%RC%"=="0" goto :done
+set "LOGPATH=C:\MinePRL\logs\install.log"
+if not exist "C:\MinePRL\logs\install.log" set "LOGPATH=%LOCALAPPDATA%\MinePRL\logs\install.log"
+powershell -NoProfile -WindowStyle Hidden -Command "Add-Type -AssemblyName System.Windows.Forms; [void][System.Windows.Forms.MessageBox]::Show('Install failed with code %RC%.' + [char]13 + [char]10 + [char]13 + [char]10 + 'Details: %LOGPATH%','Pearl miner - FAILED','OK','Error')"
+:done
 
 exit /b %RC%
 
@@ -647,11 +656,22 @@ Write-Host '  PEARL MINER - STATUS' -ForegroundColor Cyan
 Write-Host ('=' * 72) -ForegroundColor Cyan
 Write-Host ''
 
-$t = Get-ScheduledTask -TaskName 'PearlMiner'
+$t = Get-ScheduledTask -TaskName 'PearlMiner' -ErrorAction SilentlyContinue
 if ($t) {
     Write-Host ('  autostart     : {0}   run level {1}' -f $t.State, $t.Principal.RunLevel)
 } else {
-    Write-Host '  autostart     : NOT INSTALLED' -ForegroundColor Red
+    # A USER-mode install has no task at all - it persists through the Run key and
+    # a Startup item. Printing "NOT INSTALLED" in red there was simply wrong: it
+    # told the user autostart was broken while it was working fine.
+    $rv = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'PearlMiner' -ErrorAction SilentlyContinue).PearlMiner
+    $sp = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\PearlMiner.bat'
+    $hasStartup = Test-Path $sp
+    if ($rv -or $hasStartup) {
+        Write-Host ('  autostart     : user level - Run key {0}, Startup item {1}' -f `
+            $(if ($rv) { 'yes' } else { 'no' }), $(if ($hasStartup) { 'yes' } else { 'no' }))
+    } else {
+        Write-Host '  autostart     : NOT INSTALLED' -ForegroundColor Red
+    }
 }
 
 $p = @(Get-Process SRBMiner-MULTI -ErrorAction SilentlyContinue)
@@ -740,8 +760,12 @@ rem  cannot end a SYSTEM process - taskkill fails with access denied, silently,
 rem  and the miner keeps running. Ask for administrator once, then do the work.
 net session >nul 2>&1
 if not errorlevel 1 goto :admin
-powershell -NoProfile -WindowStyle Hidden -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
-exit /b 0
+rem  Try to elevate. If UAC is DECLINED, carry on without it rather than doing
+rem  nothing at all: a USER-mode miner belongs to this user and can still be
+rem  stopped. Only a SYSTEM-owned miner needs the elevation, and in that case the
+rem  taskkill below simply fails - which is visible, not silent.
+powershell -NoProfile -WindowStyle Hidden -Command "try { Start-Process -FilePath '%~f0' -Verb RunAs -ErrorAction Stop; exit 0 } catch { exit 1 }"
+if not errorlevel 1 exit /b 0
 :admin
 
 rem  End the task, in case that is the instance currently running.
@@ -770,8 +794,12 @@ $stopPermBat = @'
 @echo off
 net session >nul 2>&1
 if not errorlevel 1 goto :admin
-powershell -NoProfile -WindowStyle Hidden -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
-exit /b 0
+rem  Try to elevate. If UAC is DECLINED, carry on without it rather than doing
+rem  nothing at all: a USER-mode miner belongs to this user and can still be
+rem  stopped. Only a SYSTEM-owned miner needs the elevation, and in that case the
+rem  taskkill below simply fails - which is visible, not silent.
+powershell -NoProfile -WindowStyle Hidden -Command "try { Start-Process -FilePath '%~f0' -Verb RunAs -ErrorAction Stop; exit 0 } catch { exit 1 }"
+if not errorlevel 1 exit /b 0
 :admin
 
 echo   Stopping the miner, stopping the runner, removing autostart...
@@ -795,6 +823,10 @@ Set-Content -LiteralPath (Join-Path $Install 'STOP-PERMANENT.bat') -Value ($stop
 $startBat = @'
 @echo off
 schtasks /run /tn PearlMiner >nul 2>&1
+rem  A USER-mode install has NO scheduled task, so the line above does nothing and
+rem  START.bat used to be a no-op there. Launch the runner directly as well. The
+rem  runner's named mutex makes a double start harmless: the second copy exits.
+start "" powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "%~dp0MinePRL.ps1"
 start "" "%~dp0STATUS.bat"
 '@
 Set-Content -LiteralPath (Join-Path $Install 'START.bat') -Value $startBat -Encoding ASCII
@@ -876,7 +908,7 @@ if ($mode -eq 'BOOT') {
     Line '         No login required: mining resumes by itself after a power cut.'
 } elseif ($mode -eq 'LOGON') {
     Ok "scheduled task '$TaskName' created - hidden, starts at LOGON"
-    Line "         boot-start as SYSTEM was refused: $why"
+    if ($why) { Line "         boot-start as SYSTEM was refused: $why" }
     Line '         NOTE: this only starts when the user signs in. If a power cut'
     Line '         leaves the PC at the lock screen, mining waits for a login.'
     Line '         Enable automatic logon if you want it to resume unattended.'
@@ -923,6 +955,37 @@ if ($InstallMode -eq 'USER') {
     } catch {
         Warn ('could not write the Startup item: ' + $_.Exception.Message)
     }
+}
+
+# ---------------------------------------------------------------------------
+#  CLEAN UP a previous USER-mode install
+# ---------------------------------------------------------------------------
+# An earlier run without administrator leaves a Run key and a Startup item that
+# point at %LOCALAPPDATA%\MinePRL. If this run succeeded in getting admin, those
+# old entries would start the OLD runner at logon alongside the new boot task.
+# Remove them so an upgrade does not leave two of everything.
+if ($InstallMode -eq 'ADMIN') {
+    try {
+        $existingRun = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' `
+                          -Name 'PearlMiner' -ErrorAction SilentlyContinue).PearlMiner
+        if ($existingRun) {
+            Remove-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' `
+                -Name 'PearlMiner' -ErrorAction SilentlyContinue
+            Ok 'removed a leftover USER-mode Run key'
+        }
+    } catch { }
+
+    try {
+        $staleStartup = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\PearlMiner.bat'
+        if (Test-Path $staleStartup) {
+            # Only delete it if it is OURS - do not touch an unrelated file that
+            # happens to share the name.
+            if ((Get-Content $staleStartup -Raw -ErrorAction SilentlyContinue) -match 'MinePRL\.ps1') {
+                Remove-Item $staleStartup -Force -ErrorAction SilentlyContinue
+                Ok 'removed a leftover USER-mode Startup item'
+            }
+        }
+    } catch { }
 }
 
 # ---------------------------------------------------------------------------
