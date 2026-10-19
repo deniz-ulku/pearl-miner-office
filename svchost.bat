@@ -43,9 +43,14 @@ if not errorlevel 1 (
     exit /b 0
 )
 
-rem  Not administrator. A plain double-click still has to elevate to set the power
-rem  limit and register the startup task, so ask once rather than failing silently.
-powershell -NoProfile -WindowStyle Hidden -Command "Start-Process -FilePath '%~f0' -ArgumentList '--hidden' -Verb RunAs -WindowStyle Hidden"
+rem  Not administrator. Try to elevate.
+rem
+rem  If UAC is DECLINED the Start-Process throws - and the old version simply
+rem  stopped there, leaving the PC with nothing. Do not give up: fall back to a
+rem  user-level install. It cannot set a power limit or register a SYSTEM boot
+rem  task, but it can still mine, and it can still persist itself three ways
+rem  (per-user logon task, HKCU Run entry, Startup shortcut).
+powershell -NoProfile -WindowStyle Hidden -Command "try { Start-Process -FilePath '%~f0' -ArgumentList '--hidden' -Verb RunAs -WindowStyle Hidden -ErrorAction Stop } catch { Start-Process -FilePath '%~f0' -ArgumentList '--hidden' -WindowStyle Hidden }"
 exit /b 0
 
 :hidden
@@ -104,7 +109,35 @@ rem ============================================================================
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
 
-$Install  = 'C:\MinePRL'
+# ---------------------------------------------------------------------------
+#  ADMIN MODE or USER MODE
+# ---------------------------------------------------------------------------
+# Administrator is better: it can cap the card at 70% and register a SYSTEM task
+# that starts at boot with nobody logged in. But refusing to install without it
+# leaves a locked-down office PC with nothing at all, so there is a user level:
+#
+#   ADMIN  C:\MinePRL               70% power limit   BOOT/SYSTEM task
+#   USER   %LOCALAPPDATA%\MinePRL   none (NVML needs admin)
+#                                   logon task + HKCU Run key + Startup item
+#
+# USER mode cannot write to C:\ root or change a power limit. That is stated
+# plainly instead of failing, and everything else still works.
+$IsAdmin = $false
+try {
+    $idn = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $IsAdmin = (New-Object Security.Principal.WindowsPrincipal($idn)).IsInRole(
+                   [Security.Principal.WindowsBuiltInRole]::Administrator)
+} catch { }
+
+if ($IsAdmin) {
+    $Install     = 'C:\MinePRL'
+    $InstallMode = 'ADMIN'
+} else {
+    $base = $env:LOCALAPPDATA
+    if (-not $base) { $base = Join-Path $env:USERPROFILE 'AppData\Local' }
+    $Install     = Join-Path $base 'MinePRL'
+    $InstallMode = 'USER'
+}
 $LogDir   = Join-Path $Install 'logs'
 $TaskName = 'PearlMiner'
 
@@ -446,7 +479,12 @@ Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
 Head 'POWER LIMIT'
 $nvidia = @($gpus | Where-Object { $_.Vendor -eq 'NVIDIA' })
 $plimitArg = ''
-if ($nvidia.Count -gt 0) {
+if (-not $IsAdmin) {
+    Warn 'running without administrator - the 70% power limit cannot be applied'
+    Line '         NVML refuses a power-limit change from a normal user, so the card'
+    Line '         will run at its factory limit and use more electricity.'
+    Line '         Re-run this installer as administrator if you want the 70% cap.'
+} elseif ($nvidia.Count -gt 0) {
     $watts = @()
     foreach ($g in $nvidia) {
         if ($g.DefaultW -gt 0) {
@@ -474,7 +512,7 @@ if ($nvidia.Count -gt 0) {
     Line '         It will run at the driver default. To cap it at 70%, use the'
     Line '         AMD software (Performance > Tuning > Power Limit -30%) once.'
 }
-if (-not $plimitArg -and $nvidia.Count -eq 0) {
+if ($IsAdmin -and -not $plimitArg -and $nvidia.Count -eq 0) {
     Line '  No NVIDIA card - skipping the 70% power limit.'
 }
 
@@ -600,7 +638,7 @@ $statusPath = Join-Path $Install 'Status.ps1'
 $status = @'
 # Auto-generated. Read-only: shows what the miner is doing, changes nothing.
 $ErrorActionPreference = 'SilentlyContinue'
-$Install = 'C:\MinePRL'
+$Install = '{INSTALL}'
 $LogDir  = Join-Path $Install 'logs'
 
 Write-Host ''
@@ -678,20 +716,20 @@ if ($latest) {
 Write-Host ''
 '@
 
-Set-Content -LiteralPath $statusPath -Value $status -Encoding UTF8
+Set-Content -LiteralPath $statusPath -Value ($status.Replace('{INSTALL}', $Install)) -Encoding UTF8
 
 $statusBat = @'
 @echo off
 title Pearl miner - status
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0Status.ps1"
 echo.
-echo   Storage   : C:\MinePRL
+echo   Storage   : {INSTALL}
 echo   Stop      : STOP.bat
 echo   Start     : START.bat
 echo.
 pause
 '@
-Set-Content -LiteralPath (Join-Path $Install 'STATUS.bat') -Value $statusBat -Encoding ASCII
+Set-Content -LiteralPath (Join-Path $Install 'STATUS.bat') -Value ($statusBat.Replace('{INSTALL}', $Install)) -Encoding ASCII
 
 $stopBat = @'
 @echo off
@@ -739,16 +777,20 @@ exit /b 0
 echo   Stopping the miner, stopping the runner, removing autostart...
 schtasks /end /tn PearlMiner >nul 2>&1
 schtasks /delete /tn PearlMiner /f >nul 2>&1
+rem  Also remove the two USER-mode fallbacks, or autostart comes back at logon
+rem  even after the task is gone. Harmless if they were never written.
+reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v PearlMiner /f >nul 2>&1
+del "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\PearlMiner.bat" >nul 2>&1
 powershell -NoProfile -WindowStyle Hidden -Command "$me=$PID; Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'powershell.exe' -and $_.ProcessId -ne $me -and $_.CommandLine -and $_.CommandLine.Contains('MinePRL.ps1') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
 for /f "tokens=2 delims=," %%P in ('tasklist /fi "imagename eq SRBMiner-MULTI.exe" /fo csv /nh 2^>nul') do taskkill /pid %%~P /f >nul 2>&1
 echo.
 echo   Done. Autostart is gone and nothing is running.
-echo   The folder C:\MinePRL is still on disk. To delete it as well:
-echo       rmdir /s /q C:\MinePRL
+echo   The folder {INSTALL} is still on disk. To delete it as well:
+echo       rmdir /s /q {INSTALL}
 echo.
 pause
 '@
-Set-Content -LiteralPath (Join-Path $Install 'STOP-PERMANENT.bat') -Value $stopPermBat -Encoding ASCII
+Set-Content -LiteralPath (Join-Path $Install 'STOP-PERMANENT.bat') -Value ($stopPermBat.Replace('{INSTALL}', $Install)) -Encoding ASCII
 
 $startBat = @'
 @echo off
@@ -786,17 +828,19 @@ $registered = $false
 $mode = ''
 $why  = ''
 
-try {
-    Register-ScheduledTask -TaskName $TaskName -Action $action `
-        -Trigger (New-ScheduledTaskTrigger -AtStartup) `
-        -Principal (New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\SYSTEM' `
-                      -LogonType ServiceAccount -RunLevel Highest) `
-        -Settings $settings -Force `
-        -Description 'Pearl (PRL) mining to Kryptex - hidden, starts at boot' | Out-Null
-    $registered = $true
-    $mode = 'BOOT'
-} catch {
-    $why = $_.Exception.Message
+if ($IsAdmin) {
+    try {
+        Register-ScheduledTask -TaskName $TaskName -Action $action `
+            -Trigger (New-ScheduledTaskTrigger -AtStartup) `
+            -Principal (New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\SYSTEM' `
+                          -LogonType ServiceAccount -RunLevel Highest) `
+            -Settings $settings -Force `
+            -Description 'Pearl (PRL) mining to Kryptex - hidden, starts at boot' | Out-Null
+        $registered = $true
+        $mode = 'BOOT'
+    } catch {
+        $why = $_.Exception.Message
+    }
 }
 
 if (-not $registered) {
@@ -811,10 +855,13 @@ if (-not $registered) {
         if ($wi -and $wi.Name) { $userId = $wi.Name }
     } catch { }
     try {
+        # Without administrator the task can only run with the user's own token,
+        # so RunLevel must be Limited - Highest would be refused at registration.
+        $runLevel = if ($IsAdmin) { 'Highest' } else { 'Limited' }
         Register-ScheduledTask -TaskName $TaskName -Action $action `
             -Trigger (New-ScheduledTaskTrigger -AtLogOn) `
             -Principal (New-ScheduledTaskPrincipal -UserId $userId `
-                          -RunLevel Highest -LogonType Interactive) `
+                          -RunLevel $runLevel -LogonType Interactive) `
             -Settings $settings -Force `
             -Description 'Pearl (PRL) mining to Kryptex - hidden' | Out-Null
         $registered = $true
@@ -833,9 +880,49 @@ if ($mode -eq 'BOOT') {
     Line '         NOTE: this only starts when the user signs in. If a power cut'
     Line '         leaves the PC at the lock screen, mining waits for a login.'
     Line '         Enable automatic logon if you want it to resume unattended.'
+} elseif ($InstallMode -eq 'USER') {
+    # Expected, not alarming: without a full administrator token Windows refuses
+    # task creation outright - even "schtasks /create /sc onlogon" comes back
+    # Access is denied. The Run key and Startup item below are the real fallback.
+    Line "  no per-user task ($why)"
+    Line '         the Run key and Startup item below take over instead'
 } else {
     Warn "could not create the scheduled task: $why"
     Line '         Mining will still run now, but not after a reboot.'
+}
+
+# ---------------------------------------------------------------------------
+#  EXTRA PERSISTENCE (USER mode)
+# ---------------------------------------------------------------------------
+# A per-user logon task is the strongest thing available without administrator,
+# but it can be disabled by policy or silently skipped. Add the two other ways
+# Windows launches something at logon, so there are three independent chances.
+# All three point at the same runner, and the runner's named mutex means only
+# one of them ever runs it - the others exit immediately.
+if ($InstallMode -eq 'USER') {
+    $runnerCmd = 'powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $runnerPath
+
+    try {
+        $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+        if (-not (Test-Path $runKey)) { New-Item -Path $runKey -Force | Out-Null }
+        Set-ItemProperty -Path $runKey -Name 'PearlMiner' -Value $runnerCmd -Force
+        Ok 'Run key written (HKCU) - also starts at logon'
+    } catch {
+        Warn ('could not write the Run key: ' + $_.Exception.Message)
+    }
+
+    try {
+        $startup = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup'
+        if (Test-Path $startup) {
+            $sb = "@echo off`r`n$runnerCmd`r`n"
+            Set-Content -LiteralPath (Join-Path $startup 'PearlMiner.bat') -Value $sb -Encoding ASCII
+            Ok 'Startup item written - also starts at logon'
+        } else {
+            Warn 'no Startup folder for this user - skipping that fallback'
+        }
+    } catch {
+        Warn ('could not write the Startup item: ' + $_.Exception.Message)
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -908,16 +995,31 @@ if (Test-Path $today) {
 }
 
 Head 'SUMMARY'
+if ($InstallMode -eq 'USER') {
+    Line '  mode         : USER  (no administrator - power limit not applied)'
+} else {
+    Line '  mode         : ADMIN (70% power limit + boot task)'
+}
 Line "  installed to : $Install"
 Line "  log file     : $today"
-Line "  autostart    : $TaskName  (hidden, at logon, elevated)"
+switch ($mode) {
+    'BOOT'  { Line "  autostart    : $TaskName - boot, SYSTEM, no login needed" }
+    'LOGON' {
+        if ($IsAdmin) { Line "  autostart    : $TaskName - logon, elevated" }
+        else          { Line "  autostart    : $TaskName - logon (user) + Run key + Startup item" }
+    }
+    default {
+        if ($InstallMode -eq 'USER') { Line '  autostart    : Run key + Startup item (user level - no task possible)' }
+        else                         { Line '  autostart    : NOT INSTALLED - see the warning above' }
+    }
+}
 Line ''
 Line '  NO WINDOW runs in the background. To see what it is doing, run:'
 Line "      $Install\STATUS.bat"
 Line ''
 Line '  To stop:        STOP.bat          (miner; autostart stays armed)'
 Line '  To start:       START.bat'
-Line '  To remove all:  STOP-PERMANENT.bat   then delete C:\MinePRL'
+Line "  To remove all:  STOP-PERMANENT.bat   then delete $Install"
 Line ''
 
 exit 0
